@@ -16,13 +16,11 @@ from concurrent.futures import ThreadPoolExecutor
 start_time = time.time()
 
 # -------------------- ENV & AUTH --------------------
-sec = os.getenv("ASHRITHA_SECRET_KEY")
-User_name = os.getenv("USERNAME")
+METABASE_API_KEY = os.getenv("METABASE_API_KEY")
 service_account_json = os.getenv("SERVICE_ACCOUNT_JSON")
-MB_URL = os.getenv("METABASE_URL")
 BATCH_METRICS_SHEET_KEY = os.getenv("BATCH_METRICS_SHEET_KEY")
 
-if not sec or not service_account_json:
+if not METABASE_API_KEY or not service_account_json:
     raise ValueError("❌ Missing environment variables. Check GitHub secrets.")
 if not BATCH_METRICS_SHEET_KEY:
     raise ValueError("❌ BATCH_METRICS_SHEET_KEY is not set. Check GitHub secrets.")
@@ -39,20 +37,11 @@ creds = Credentials.from_service_account_info(
 gc = gspread.authorize(creds)
 
 # -------------------- METABASE AUTH --------------------
-res = requests.post(
-    MB_URL,
-    headers={"Content-Type": "application/json"},
-    json={"username": User_name, "password": sec}
-)
-res.raise_for_status()
-token = res.json()['id']
 METABASE_HEADERS = {
     'Content-Type': 'application/json',
-    'X-Metabase-Session': token
+    'x-api-key': METABASE_API_KEY
 }
-print("✅ Metabase session created")
-
-SHEET_KEY = BATCH_METRICS_SHEET_KEY
+print("✅ Using Metabase API key auth")
 
 # -------------------- UTILITIES --------------------
 def mb_post(card_url):
