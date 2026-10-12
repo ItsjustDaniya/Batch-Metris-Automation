@@ -18,12 +18,10 @@ start_time = time.time()
 # -------------------- ENV & AUTH --------------------
 METABASE_API_KEY = os.getenv("METABASE_API_KEY")
 service_account_json = os.getenv("SERVICE_ACCOUNT_JSON")
-SHEET_KEY = os.getenv("BATCH_METRICS_SHEET_KEY")
+SHEET_KEY = '1BQhfdhQANZUuuLvpUc5NgqBk9ONntyNwZOcXxvhuxCg'   # Batch metrics main sheet
 
 if not METABASE_API_KEY or not service_account_json:
     raise ValueError("❌ Missing environment variables. Check GitHub secrets.")
-if not SHEET_KEY:
-    raise ValueError("❌ BATCH_METRICS_SHEET_KEY is not set. Check GitHub secrets.")
 
 # -------------------- GOOGLE AUTH --------------------
 service_info = json.loads(service_account_json)
@@ -52,7 +50,8 @@ def mb_post(card_url):
 
 def write_sheet(sheet_key, worksheet_name, df):
     """Clear and write a DataFrame to a Google Sheet."""
-    print(f"🔄 Updating sheet: {worksheet_name}")
+    df = add_segment_cols(df, worksheet_name)
+    print(f"🔄 Updating sheet: {worksheet_name} ({len(df)} rows)")
     for attempt in range(1, 6):
         try:
             sheet = gc.open_by_key(sheet_key)
@@ -79,17 +78,95 @@ def clean_to_int(series):
         errors='coerce'
     ).fillna(0).astype(int)
 
+# -------------------- GEM / PROGRAM SEGMENTS (Oct 2026) --------------------
+# Every tab gets a `gem_label` (GEM / Non-GEM / Not tagged) and a `Program`
+# (PCDS / Adv+ / Advantage / Agentic AI / Xcelerate / Other) column so Looker can filter on them.
+# Adv+ students carry the 'Advantage +' label (722) in card 6289, so they now count as enrolled.
+ENROLLED_LABELS = ['Enrolled', 'Advantage +']
+NOT_TAGGED = 'Not tagged'
+BATCH_NAME_COLUMNS = ['au_batch_name', 'Au_name', 'Admin_unit_name', 'admin_unit_name', 'AU_batch', 'Batch', 'batch']
+
+
+def program_from_batch(name):
+    """Program from an AU batch name, e.g. 'Newton Advantage Plus - Data Analytics May 2026' -> 'Adv+'."""
+    n = str(name or '').lower()
+    if not n or n == 'nan':
+        return 'Other'
+    if 'advantage plus' in n or 'advantage +' in n or 'adv+' in n:
+        return 'Adv+'
+    if 'advantage' in n:
+        return 'Advantage'
+    if 'agentic' in n:
+        return 'Agentic AI'
+    if 'xcelerate' in n:
+        return 'Xcelerate'
+    if 'data science' in n or 'pcds' in n:
+        return 'PCDS'
+    return 'Other'
+
+
+def add_segment_cols(df, worksheet_name=''):
+    """Tidy gem_label and put a Program column at the end of every tab."""
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    if 'gem_label' in df.columns:
+        df['gem_label'] = df['gem_label'].replace('', np.nan).fillna(NOT_TAGGED)
+    if 'program' in df.columns and 'Program' not in df.columns:      # from the Metabase cards
+        df = df.rename(columns={'program': 'Program'})
+    if 'Program' not in df.columns:
+        name_col = next((c for c in BATCH_NAME_COLUMNS if c in df.columns), None)
+        if name_col is None:
+            print(f"   ℹ️ {worksheet_name}: no batch name column — Program not added")
+            return df
+        df['Program'] = df[name_col].apply(program_from_batch)
+    df['Program'] = df['Program'].fillna('Other')
+    return df[[c for c in df.columns if c != 'Program'] + ['Program']]
+
+
+_USER_SEGMENTS = None
+
+def get_user_segments():
+    """user_id -> latest AU batch name + gem_label, from card 6289 (fetched once per run)."""
+    global _USER_SEGMENTS
+    if _USER_SEGMENTS is None:
+        r = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/6289/query/json')
+        g = pd.DataFrame(r.json())
+        g['user_id'] = clean_to_int(g['user_id'])
+        g['gem_label'] = g['gem_label'].fillna(NOT_TAGGED)
+        sort_col = next((c for c in ['au_start_date', 'AU_start_date'] if c in g.columns), None)
+        if sort_col:
+            g = g.sort_values(sort_col, ascending=False)          # latest AU wins
+        _USER_SEGMENTS = g.drop_duplicates('user_id')[['user_id', 'au_batch_name', 'gem_label']]
+    return _USER_SEGMENTS
+
+
 def fetch_enrolled_df():
-    """Fetch enrolled students from Metabase card 6289."""
+    """Fetch enrolled students (PCDS and Adv+) from Metabase card 6289."""
     r = mb_post('https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/6289/query/json')
     df_au = pd.DataFrame(r.json())
     df_au = df_au[['user_id', 'label', 'au_batch_name', 'gem_label']]
-    df_au = df_au[df_au['label'].isin(['Enrolled'])]
+    df_au = df_au[df_au['label'].isin(ENROLLED_LABELS)]
     df_au['user_id'] = clean_to_int(df_au['user_id'])
     df_au = df_au.rename(columns={'au_batch_name': 'admin_unit_name'})
     # Fill null gem_label so it's never dropped from grouping downstream
-    df_au['gem_label'] = df_au['gem_label'].fillna('')
+    df_au['gem_label'] = df_au['gem_label'].fillna(NOT_TAGGED)
+    df_au = df_au.drop_duplicates(['user_id', 'admin_unit_name'])
     return df_au
+
+
+def valid_contest_keys(df, min_entries):
+    """Contests that count, as (admin_unit_name, module_name, contest_date).
+    Same rule as before: more than `min_entries` entries in that AU batch. Adv+ batches are
+    small (8-40 students) and sit the same contest as PCDS, so an Adv+ batch's contest also
+    counts when that module + date is a valid contest for another batch."""
+    k = ['admin_unit_name', 'module_name', 'contest_date']
+    counts = df.groupby(k).size().reset_index(name='batch_entries')
+    valid = counts[counts['batch_entries'] > min_entries]
+    is_adv = counts['admin_unit_name'].apply(program_from_batch) == 'Adv+'
+    shared = counts[is_adv].merge(valid[['module_name', 'contest_date']].drop_duplicates(),
+                                  on=['module_name', 'contest_date'])
+    return pd.concat([valid[k], shared[k]]).drop_duplicates()
 
 # -------------------- SECTION 1: ASSIGNMENT --------------------
 def run_assignment():
@@ -149,6 +226,22 @@ def run_placement_phase():
     )
     filtered_df = df[denominator_mask].copy()
 
+    # GEM / Program per student (via user id -> card 6289); falls back to the Batch name
+    uid_col = next((c for c in ['User ID', 'UserID', 'User Id', 'user_id', 'Userid', 'userid'] if c in filtered_df.columns), None)
+    if uid_col:
+        seg = get_user_segments()
+        filtered_df['_uid'] = clean_to_int(filtered_df[uid_col])
+        filtered_df = filtered_df.merge(seg.rename(columns={'user_id': '_uid'}), on='_uid', how='left')
+        filtered_df['gem_label'] = filtered_df['gem_label'].fillna(NOT_TAGGED)
+        filtered_df['Program'] = filtered_df['au_batch_name'].apply(program_from_batch)
+        no_match = filtered_df['au_batch_name'].isna()
+        filtered_df.loc[no_match, 'Program'] = filtered_df.loc[no_match, 'Batch'].apply(program_from_batch)
+    else:
+        print("   ℹ️ Placement_Phase: no user id column found — GEM split skipped")
+        filtered_df['gem_label'] = NOT_TAGGED
+        filtered_df['Program'] = filtered_df['Batch'].apply(program_from_batch)
+    keys = ['Batch', 'gem_label', 'Program']
+
     recommended_mask = (filtered_df['Recommended date'].notna()) & \
                        (filtered_df['Recommended date'].astype(str).str.strip() != "")
     grooming_mask = (filtered_df['Grooming Pool (Picked)'].notna()) & \
@@ -167,16 +260,16 @@ def run_placement_phase():
     pr_mask = filtered_df['Phase'].str.lower().isin([p.lower() for p in pr_list]) + \
               filtered_df['PR'].str.lower().isin([p.lower() for p in demoted_list])
 
-    batch_stats   = filtered_df.groupby('Batch').size().reset_index(name='Total_Eligible_#')
-    rec_counts    = filtered_df[recommended_mask].groupby('Batch').size().reset_index(name='Recommended_#')
-    gro_counts    = filtered_df[grooming_mask].groupby('Batch').size().reset_index(name='Grooming_#')
-    place_counts  = filtered_df[placement_mask].groupby('Batch').size().reset_index(name='Placement_#')
-    pr_counts     = filtered_df[pr_mask].groupby('Batch').size().reset_index(name='PR_#')
+    batch_stats   = filtered_df.groupby(keys).size().reset_index(name='Total_Eligible_#')
+    rec_counts    = filtered_df[recommended_mask].groupby(keys).size().reset_index(name='Recommended_#')
+    gro_counts    = filtered_df[grooming_mask].groupby(keys).size().reset_index(name='Grooming_#')
+    place_counts  = filtered_df[placement_mask].groupby(keys).size().reset_index(name='Placement_#')
+    pr_counts     = filtered_df[pr_mask].groupby(keys).size().reset_index(name='PR_#')
 
-    summary = pd.merge(batch_stats, rec_counts, on='Batch', how='left').fillna(0)
-    summary = pd.merge(summary, gro_counts, on='Batch', how='left').fillna(0)
-    summary = pd.merge(summary, place_counts, on='Batch', how='left').fillna(0)
-    summary = pd.merge(summary, pr_counts, on='Batch', how='left').fillna(0)
+    summary = pd.merge(batch_stats, rec_counts, on=keys, how='left').fillna(0)
+    summary = pd.merge(summary, gro_counts, on=keys, how='left').fillna(0)
+    summary = pd.merge(summary, place_counts, on=keys, how='left').fillna(0)
+    summary = pd.merge(summary, pr_counts, on=keys, how='left').fillna(0)
 
     count_cols = ['Total_Eligible_#', 'Recommended_#', 'Grooming_#', 'Placement_#', 'PR_#']
     summary[count_cols] = summary[count_cols].astype(int)
@@ -191,7 +284,8 @@ def run_placement_phase():
         'Recommended_#', 'Recommended_%',
         'Grooming_#', 'Grooming_%',
         'PR_#', 'PR_%',
-        'Placement_#', 'Placement_%'
+        'Placement_#', 'Placement_%',
+        'gem_label', 'Program'   # new columns, kept at the end so Looker doesn't break
     ]]
     write_sheet(SHEET_KEY, "Placement_Phase", final_report)
 
@@ -211,7 +305,7 @@ def run_mc_attempt_wise():
     df = pd.merge(df, df_au, on=['user_id', 'admin_unit_name'], how='inner')
 
     # Fill null gem_label so it's never dropped from grouping downstream
-    df['gem_label'] = df['gem_label'].fillna('')
+    df['gem_label'] = df['gem_label'].fillna(NOT_TAGGED)
 
     df['Total Score'] = pd.to_numeric(df['Total Score'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
     df['contest_date'] = pd.to_datetime(df['contest_date'])
@@ -230,7 +324,8 @@ def run_mc_attempt_wise():
         cleared_count=('is_cleared', 'sum')
     ).reset_index()
 
-    attempts_filtered = attempts_group[attempts_group['total_entries'] > 10].copy()
+    # Which contests count is decided per AU batch (not per GEM segment), so a segment isn't dropped
+    attempts_filtered = attempts_group.merge(valid_contest_keys(df, 10), on=['admin_unit_name', 'module_name', 'contest_date'])
     attempts_filtered = attempts_filtered.sort_values(['admin_unit_name', 'gem_label', 'module_name', 'contest_date'])
     attempts_filtered['Attempt_number'] = attempts_filtered.groupby(['admin_unit_name', 'gem_label', 'module_name']).cumcount() + 1
 
@@ -274,20 +369,24 @@ def run_mid_mc_attempt_wise():
     df['is_cleared'] = df['Total Score'] >= threshold
     df['scored_gt_1'] = df['Total Score'] > 1
 
-    batch_strength = df.groupby('admin_unit_name')['user_id'].nunique().reset_index()
-    batch_strength.columns = ['admin_unit_name', 'Batch_strength']
+    df['gem_label'] = df['gem_label'].fillna(NOT_TAGGED)
 
-    attempts_group = df.groupby(['admin_unit_name', 'module_name', 'contest_date']).agg(
+    # Batch strength split by gem_label too
+    batch_strength = df.groupby(['admin_unit_name', 'gem_label'])['user_id'].nunique().reset_index()
+    batch_strength.columns = ['admin_unit_name', 'gem_label', 'Batch_strength']
+
+    attempts_group = df.groupby(['admin_unit_name', 'gem_label', 'module_name', 'contest_date']).agg(
         total_entries=('user_id', 'count'),
         scored_gt_1_count=('scored_gt_1', 'sum'),
         cleared_count=('is_cleared', 'sum')
     ).reset_index()
 
-    attempts_filtered = attempts_group[attempts_group['total_entries'] > 20].copy()
-    attempts_filtered = attempts_filtered.sort_values(['admin_unit_name', 'module_name', 'contest_date'])
-    attempts_filtered['Attempt_number'] = attempts_filtered.groupby(['admin_unit_name', 'module_name']).cumcount() + 1
+    # Which contests count (>20 entries) is decided per AU batch, not per GEM segment
+    attempts_filtered = attempts_group.merge(valid_contest_keys(df, 20), on=['admin_unit_name', 'module_name', 'contest_date'])
+    attempts_filtered = attempts_filtered.sort_values(['admin_unit_name', 'gem_label', 'module_name', 'contest_date'])
+    attempts_filtered['Attempt_number'] = attempts_filtered.groupby(['admin_unit_name', 'gem_label', 'module_name']).cumcount() + 1
 
-    final_df = pd.merge(attempts_filtered, batch_strength, on='admin_unit_name', how='left')
+    final_df = pd.merge(attempts_filtered, batch_strength, on=['admin_unit_name', 'gem_label'], how='left')
     final_df['Attempt%']   = (final_df['scored_gt_1_count'] / final_df['Batch_strength'].replace(0, 1)) * 100
     final_df['Clearance%'] = (final_df['cleared_count']     / final_df['Batch_strength'].replace(0, 1)) * 100
 
@@ -297,7 +396,7 @@ def run_mid_mc_attempt_wise():
         'contest_date': 'Contest_date'
     })
 
-    result_cols = ['Admin_unit_name', 'Batch_strength', 'Module_name', 'Attempt_number', 'Contest_date', 'Attempt%', 'Clearance%']
+    result_cols = ['Admin_unit_name', 'Batch_strength', 'Module_name', 'Attempt_number', 'Contest_date', 'Attempt%', 'Clearance%', 'gem_label']
     final_report = final_df[result_cols].copy()
     final_report['Contest_date'] = final_report['Contest_date'].dt.strftime('%Y-%m-%d')
     final_report['Attempt%']   = final_report['Attempt%'].round(2)
@@ -321,15 +420,13 @@ def run_mc_overall_wise():
     df = pd.merge(df, df_au, on=['user_id', 'admin_unit_name'], how='inner')
 
     # Fill null gem_label so it's never dropped from grouping downstream
-    df['gem_label'] = df['gem_label'].fillna('')
+    df['gem_label'] = df['gem_label'].fillna(NOT_TAGGED)
 
     df['Total Score'] = pd.to_numeric(df['Total Score'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
     df['contest_date'] = pd.to_datetime(df['contest_date'])
 
-    valid_contests = df.groupby(['admin_unit_name', 'module_name', 'contest_date']).size().reset_index(name='count')
-    valid_contests = valid_contests[valid_contests['count'] > 10]
-    df_valid = pd.merge(df, valid_contests[['admin_unit_name', 'module_name', 'contest_date']],
-                        on=['admin_unit_name', 'module_name', 'contest_date'])
+    valid_contests = valid_contest_keys(df, 10)
+    df_valid = pd.merge(df, valid_contests, on=['admin_unit_name', 'module_name', 'contest_date'])
 
     # Batch strength split by gem_label too
     batch_strength = df.groupby(['admin_unit_name', 'gem_label'])['user_id'].nunique().reset_index()
@@ -377,15 +474,13 @@ def run_mid_mc_overall_wise():
     df = pd.merge(df, df_au, on=['user_id', 'admin_unit_name'], how='inner')
 
     # Fill null gem_label so it's never dropped from grouping downstream
-    df['gem_label'] = df['gem_label'].fillna('')
+    df['gem_label'] = df['gem_label'].fillna(NOT_TAGGED)
 
     df['Total Score'] = pd.to_numeric(df['Total Score'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
     df['contest_date'] = pd.to_datetime(df['contest_date'])
 
-    valid_contests = df.groupby(['admin_unit_name', 'module_name', 'contest_date']).size().reset_index(name='count')
-    valid_contests = valid_contests[valid_contests['count'] > 10]
-    df_valid = pd.merge(df, valid_contests[['admin_unit_name', 'module_name', 'contest_date']],
-                        on=['admin_unit_name', 'module_name', 'contest_date'])
+    valid_contests = valid_contest_keys(df, 10)
+    df_valid = pd.merge(df, valid_contests, on=['admin_unit_name', 'module_name', 'contest_date'])
 
     # Batch strength split by gem_label too
     batch_strength = df.groupby(['admin_unit_name', 'gem_label'])['user_id'].nunique().reset_index()
@@ -435,7 +530,8 @@ def parse_batch_date(batch_name):
 def calculate_project_metrics_robust(df):
     OVERALL_CUTOFF = datetime.now()
     df.columns = df.columns.str.strip()
-    df = df[df['label'] == 'Enrolled']
+    df = df[df['label'].isin(ENROLLED_LABELS)]
+    df['gem_label'] = df['gem_label'].fillna(NOT_TAGGED)
     df = df[df['Module_name'].isin(['DS 02 Spreadsheets', 'DS 04 SQL', 'DS 03 Power BI'])]
 
     df['marks_obtained']          = pd.to_numeric(df['marks_obtained'], errors='coerce')
@@ -443,7 +539,7 @@ def calculate_project_metrics_robust(df):
     df['Submission Time']         = pd.to_datetime(df['Submission Time'], errors='coerce')
 
     metrics_list = []
-    for (au_batch_name, batch, module), group in df.groupby(['au_batch_name', 'Batch', 'Module_name']):
+    for (au_batch_name, gem_label, batch, module), group in df.groupby(['au_batch_name', 'gem_label', 'Batch', 'Module_name']):
         denominator = group['user_id'].nunique()
         release_dt_raw = group['project_release_date'].min()
         if pd.isna(release_dt_raw):
@@ -459,6 +555,7 @@ def calculate_project_metrics_robust(df):
 
         res = {
             'au_batch_name': au_batch_name,
+            'gem_label': gem_label,
             'batch': batch,
             'Module': module,
             'Release Date': release_date.strftime('%Y-%m-%d'),
@@ -475,6 +572,8 @@ def calculate_project_metrics_robust(df):
         metrics_list.append(res)
 
     result_df = pd.DataFrame(metrics_list)
+    if result_df.empty:
+        return result_df
     result_df['Sort_Key'] = result_df['batch'].apply(parse_batch_date)
     result_df = result_df.sort_values(by=['Sort_Key', 'Module']).drop(columns=['Sort_Key'])
 
@@ -483,7 +582,8 @@ def calculate_project_metrics_robust(df):
         'M0 Attempt %', 'M0 Clearance %',
         'M1 Attempt %', 'M1 Clearance %',
         'M2 Attempt %', 'M2 Clearance %',
-        'MTD Attempt %', 'MTD Clearance %'
+        'MTD Attempt %', 'MTD Clearance %',
+        'gem_label'   # new column, kept at the end so Looker doesn't break
     ]
     return result_df[final_columns]
 
@@ -496,7 +596,7 @@ def run_projects():
 
     df1 = pd.DataFrame(r1.json())
     df2 = pd.DataFrame(r2.json())
-    df3 = pd.DataFrame(r3.json())[['user_id', 'au_batch_name', 'label']]
+    df3 = pd.DataFrame(r3.json())[['user_id', 'au_batch_name', 'label', 'gem_label']]
 
     concatenated_df = pd.concat([df1, df2], axis=0, ignore_index=True)
     concatenated_df = concatenated_df.rename(columns={'User ID': 'user_id'})
